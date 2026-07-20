@@ -1,15 +1,26 @@
 import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   verifyDoctor,
   verifyClient,
   submitVerification,
 } from "@/lib/verification.functions";
+import { getSession, login, logout, signUp } from "@/lib/auth.functions";
 
 export const Route = createFileRoute("/")({
   component: HomePage,
 });
+
+type AuthUser = {
+  email: string;
+  name: string;
+  role: string;
+  registrationNo?: string;
+  phone?: string;
+  npi?: string;
+  licenses?: DoctorLicense[];
+};
 
 type DoctorLicense = {
   license_number: string;
@@ -35,6 +46,117 @@ function HomePage() {
   const [doctor, setDoctor] = useState<VerifiedDoctor | null>(null);
   const [client, setClient] = useState<VerifiedClient | null>(null);
   const [submissionId, setSubmissionId] = useState<string | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [npi, setNpi] = useState('');
+  const [phone, setPhone] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [pendingSignUp, setPendingSignUp] = useState<{
+    npi: string;
+    email: string;
+    phone: string;
+  } | null>(null);
+  const [pendingSignIn, setPendingSignIn] = useState<AuthUser | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
+  const getSessionFn = useServerFn(getSession);
+  const loginFn = useServerFn(login);
+  const signUpFn = useServerFn(signUp);
+  const logoutFn = useServerFn(logout);
+
+  useEffect(() => {
+    void (async () => {
+      setAuthLoading(true);
+      try {
+        const res = await getSessionFn();
+        if (res.authenticated) {
+          setUser(res.user);
+          if (res.user.npi && res.user.licenses?.length) {
+            setDoctor({
+              npi: res.user.npi,
+              doctorName: res.user.name,
+              licenses: res.user.licenses,
+            });
+            setStep(2);
+          }
+        } else {
+          setUser(null);
+        }
+      } catch (err) {
+        setUser(null);
+      } finally {
+        setAuthLoading(false);
+      }
+    })();
+  }, [getSessionFn]);
+
+  async function handleAuthSubmit(e: FormEvent) {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthSubmitting(true);
+
+    try {
+      const trimmedEmail = email.trim();
+      const trimmedNpi = npi.trim();
+      const trimmedPhone = phone.trim();
+      const res = authMode === 'signup'
+        ? await signUpFn({ data: { npi: trimmedNpi, email: trimmedEmail, phone: trimmedPhone, password } })
+        : await loginFn({ data: { email: trimmedEmail, password } });
+
+      if (!res.ok) {
+        setAuthError(res.error ?? (authMode === 'signup' ? 'Signup failed' : 'Login failed'));
+      } else if (authMode === 'signup') {
+        setPendingSignUp({ npi: trimmedNpi, email: trimmedEmail, phone: trimmedPhone });
+        setPendingSignIn(res.user);
+        setAuthMode('login');
+        setNpi('');
+        setPhone('');
+        setPassword('');
+        setAuthError(null);
+      } else {
+        setPendingSignIn(res.user);
+        setPendingSignUp(null);
+        setAuthError(null);
+      }
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : (authMode === 'signup' ? 'Signup failed' : 'Login failed'));
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
+
+  async function handleLogout() {
+    setAuthError(null);
+    try {
+      await logoutFn();
+    } catch {
+      // ignore
+    }
+    setUser(null);
+    setDoctor(null);
+    setClient(null);
+    setSubmissionId(null);
+    setStep(1);
+  }
+
+  const confirmingSignUp = Boolean(pendingSignUp);
+  const confirmingSignIn = Boolean(pendingSignIn);
+  const pendingConfirmData = pendingSignUp ?? pendingSignIn;
+
+  function confirmPendingSignIn() {
+    if (!pendingSignIn) return;
+    setUser(pendingSignIn);
+    setPendingSignIn(null);
+    setPendingSignUp(null);
+    if (pendingSignIn.npi && pendingSignIn.licenses?.length) {
+      setDoctor({ npi: pendingSignIn.npi, doctorName: pendingSignIn.name, licenses: pendingSignIn.licenses });
+      setStep(2);
+    }
+    setAuthError(null);
+  }
 
   return (
     <main className="min-h-screen">
@@ -53,64 +175,240 @@ function HomePage() {
         </div>
       </header>
 
-      <section className="mx-auto max-w-4xl px-6 pt-10 pb-6">
-        <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
-          Certify a passenger for reduced-fare transit
-        </h1>
-        <p className="mt-3 text-[var(--color-muted-foreground)] max-w-2xl">
-          Complete three quick steps: verify your NPI credentials, look up the
-          transit provider &amp; passenger record, and file the disability
-          assessment. Records are stored securely for the transit agency.
-        </p>
-      </section>
+      {authLoading ? (
+        <section className="mx-auto max-w-4xl px-6 pt-10 pb-16">
+          <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
+            <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">Checking session</h1>
+            <p className="mt-3 text-[var(--color-muted-foreground)] max-w-2xl">
+              Loading your account and verifying whether you are signed in.
+            </p>
+          </div>
+        </section>
+      ) : !user ? (
+        <section className="mx-auto max-w-4xl px-6 pt-10 pb-16">
+          <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8">
+            <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
+              {pendingSignUp ? 'Confirm your new account' : pendingSignIn ? 'Confirm your sign in' : 'Sign in to continue'}
+            </h1>
+            <p className="mt-3 text-[var(--color-muted-foreground)] max-w-2xl">
+              {pendingSignUp ? (
+                'We found a matching doctor account from your signup. Confirm this was you before logging in.'
+              ) : pendingSignIn ? (
+                'A sign-in attempt succeeded. Confirm this was you before continuing.'
+              ) : (
+                'You must sign in as a verified physician to use this verification portal.'
+              )}
+            </p>
 
-      <section className="mx-auto max-w-4xl px-6 pb-4">
-        <Stepper step={step} />
-      </section>
+            {pendingConfirmData ? (
+              <div className="mt-8 space-y-4">
+                <div className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)] p-6">
+                  <p className="text-sm text-[var(--color-muted-foreground)]">Account details</p>
+                  {pendingConfirmData.name ? (
+                    <p className="mt-2"><strong>Name:</strong> {pendingConfirmData.name}</p>
+                  ) : null}
+                  <p className="mt-2"><strong>Email:</strong> {pendingConfirmData.email}</p>
+                  {pendingConfirmData.npi ? (
+                    <p className="mt-1"><strong>NPI:</strong> {pendingConfirmData.npi}</p>
+                  ) : null}
+                  {pendingConfirmData.phone ? (
+                    <p className="mt-1"><strong>Phone:</strong> {pendingConfirmData.phone}</p>
+                  ) : null}
+                </div>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    onClick={confirmPendingSignIn}
+                  >
+                    Yes, this was me
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => {
+                      setPendingSignUp(null);
+                      setPendingSignIn(null);
+                      setAuthMode(confirmingSignUp ? 'signup' : 'login');
+                      setNpi('');
+                      setEmail('');
+                      setPhone('');
+                      setPassword('');
+                      setAuthError(null);
+                    }}
+                  >
+                    No, start over
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <form onSubmit={handleAuthSubmit} className="mt-8 space-y-4">
+                  {authMode === 'signup' && (
+                    <>
+                      <div>
+                        <label htmlFor="npi" className="block text-sm font-medium mb-1.5">
+                          NPI number (10 digits)
+                        </label>
+                        <input
+                          id="npi"
+                          type="text"
+                          className="field-input"
+                          value={npi}
+                          onChange={(e) => setNpi(e.target.value.replace(/\D/g, ''))}
+                          maxLength={10}
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="phone" className="block text-sm font-medium mb-1.5">
+                          Phone number
+                        </label>
+                        <input
+                          id="phone"
+                          type="tel"
+                          className="field-input"
+                          value={phone}
+                          onChange={(e) => setPhone(e.target.value)}
+                          required
+                        />
+                      </div>
+                    </>
+                  )}
+                  <div>
+                    <label htmlFor="email" className="block text-sm font-medium mb-1.5">
+                      Email address
+                    </label>
+                    <input
+                      id="email"
+                      type="email"
+                      className="field-input"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="password" className="block text-sm font-medium mb-1.5">
+                      Password
+                    </label>
+                    <input
+                      id="password"
+                      type="password"
+                      className="field-input"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                    />
+                  </div>
+                  {authError ? <p className="text-sm text-destructive">{authError}</p> : null}
+                  <button type="submit" className="btn-primary" disabled={authSubmitting}>
+                    {authSubmitting ? (authMode === 'signup' ? 'Signing up…' : 'Signing in…') : authMode === 'signup' ? 'Sign up' : 'Sign in'}
+                  </button>
+                </form>
+                <div className="mt-4 text-sm text-[var(--color-muted-foreground)]">
+                  {authMode === 'signup' ? (
+                    <>
+                      Already have an account?{' '}
+                      <button
+                        type="button"
+                        className="font-medium text-primary underline"
+                        onClick={() => { setAuthMode('login'); setPendingSignUp(null); setAuthError(null); }}
+                      >
+                        Log in
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      New here?{' '}
+                      <button
+                        type="button"
+                        className="font-medium text-primary underline"
+                        onClick={() => { setAuthMode('signup'); setPendingSignUp(null); setAuthError(null); }}
+                      >
+                        Create account
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </section>
+      ) : (
+        <>
+          <section className="mx-auto max-w-4xl px-6 pt-10 pb-6">
+            <div className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-sm text-[var(--color-muted-foreground)]">Signed in as</p>
+                <p className="text-xl font-semibold">{user.name}</p>
+                <p className="text-sm text-[var(--color-muted-foreground)]">{user.email}</p>
+              </div>
+              <button type="button" className="btn-ghost" onClick={handleLogout}>
+                Sign out
+              </button>
+            </div>
+            <div className="mt-8">
+              <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">
+                Certify a passenger for reduced-fare transit
+              </h1>
+              <p className="mt-3 text-[var(--color-muted-foreground)] max-w-2xl">
+                Complete three quick steps: verify your NPI credentials, look up the
+                transit provider &amp; passenger record, and file the disability
+                assessment. Records are stored securely for the transit agency.
+              </p>
+            </div>
+          </section>
 
-      <section className="mx-auto max-w-4xl px-6 pb-16">
-        {step === 1 && (
-          <DoctorStep
-            onVerified={(d) => {
-              setDoctor(d);
-              setStep(2);
-            }}
-          />
-        )}
-        {step === 2 && doctor && (
-          <ClientStep
-            doctor={doctor}
-            onBack={() => setStep(1)}
-            onVerified={(c) => {
-              setClient(c);
-              setStep(3);
-            }}
-          />
-        )}
-        {step === 3 && doctor && client && (
-          <AssessmentStep
-            doctor={doctor}
-            client={client}
-            onBack={() => setStep(2)}
-            onSubmitted={(id) => {
-              setSubmissionId(id);
-              setStep(4);
-              void router.invalidate();
-            }}
-          />
-        )}
-        {step === 4 && submissionId && (
-          <SuccessStep
-            id={submissionId}
-            onRestart={() => {
-              setDoctor(null);
-              setClient(null);
-              setSubmissionId(null);
-              setStep(1);
-            }}
-          />
-        )}
-      </section>
+          <section className="mx-auto max-w-4xl px-6 pb-4">
+            <Stepper step={step} />
+          </section>
+
+          <section className="mx-auto max-w-4xl px-6 pb-16">
+            {step === 1 && (
+              <DoctorStep
+                onVerified={(d) => {
+                  setDoctor(d);
+                  setStep(2);
+                }}
+              />
+            )}
+            {step === 2 && doctor && (
+              <ClientStep
+                doctor={doctor}
+                onBack={() => setStep(1)}
+                onVerified={(c) => {
+                  setClient(c);
+                  setStep(3);
+                }}
+              />
+            )}
+            {step === 3 && doctor && client && (
+              <AssessmentStep
+                doctor={doctor}
+                client={client}
+                onBack={() => setStep(2)}
+                onSubmitted={(id) => {
+                  setSubmissionId(id);
+                  setStep(4);
+                  void router.invalidate();
+                }}
+              />
+            )}
+            {step === 4 && submissionId && (
+              <SuccessStep
+                id={submissionId}
+                onRestart={() => {
+                  setDoctor(null);
+                  setClient(null);
+                  setSubmissionId(null);
+                  setStep(1);
+                }}
+              />
+            )}
+          </section>
+        </>
+      )}
     </main>
   );
 }

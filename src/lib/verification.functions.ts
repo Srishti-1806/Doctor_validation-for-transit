@@ -1,6 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
+import { authMiddleware } from "./auth.middleware";
+
 // ---------- Step 1: verify doctor via NPI Registry ----------
 const npiSchema = z.object({
   npi: z.string().trim().regex(/^\d{10}$/, "NPI must be exactly 10 digits"),
@@ -24,6 +26,7 @@ const fallbackNpis = new Map<string, { doctorName: string; licenses: Array<{ lic
 ]);
 
 export const verifyDoctor = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
   .inputValidator((input: unknown) => npiSchema.parse(input))
   .handler(async ({ data }) => {
     const url = `https://npiregistry.cms.hhs.gov/api/?number=${data.npi}&version=2.1`;
@@ -93,6 +96,7 @@ const lookupSchema = z.object({
 });
 
 export const verifyClient = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
   .inputValidator((input: unknown) => lookupSchema.parse(input))
   .handler(async ({ data }) => {
     const { getDb } = await import("./mongo.server");
@@ -160,6 +164,7 @@ const submissionSchema = z.object({
 });
 
 export const submitVerification = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
   .inputValidator((input: unknown) => submissionSchema.parse(input))
   .handler(async ({ data }) => {
     const { getDb } = await import("./mongo.server");
