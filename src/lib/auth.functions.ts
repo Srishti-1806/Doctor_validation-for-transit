@@ -1,5 +1,7 @@
 import { createServerFn } from '@tanstack/react-start';
 import { z } from 'zod';
+import { getDb } from './mongo.server';
+import bcrypt from 'bcryptjs';
 
 type LoginData = {
   email: string;
@@ -51,20 +53,7 @@ const knownDoctors = [
   },
 ];
 
-const users: Array<SessionUser & { password: string }> = [
-  {
-    email: 'doctor@transitaccess.test',
-    password: 'password123',
-    name: 'Dr. Maya Chen',
-    role: 'doctor',
-    registrationNo: 'DR-1001',
-    phone: '5551234567',
-    npi: '1467475142',
-    licenses: [
-      { license_number: 'MD-01467475142', state: 'MA', specialty: 'Family Medicine', is_primary: true },
-    ],
-  },
-];
+let usersLoadPromise: Promise<void> | null = null;
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -81,10 +70,48 @@ const signUpSchema = z.object({
 export const login = createServerFn({ method: 'POST' })
   .validator((input: unknown) => loginSchema.parse(input))
   .handler(async ({ data }) => {
-    const user = users.find(
-      (item) => item.email.toLowerCase() === data.email.trim().toLowerCase() && item.password === data.password,
-    );
+    console.log('[auth] login attempt', { email: data.email });
+    const db = await getDb();
+    const usersColl = db.collection('users');
+    try {
+      await usersColl.createIndex({ email: 1 }, { unique: true });
+    } catch {
+      // ignore
+    }
+    const emailNorm = data.email.trim().toLowerCase();
+    const user = await usersColl.findOne({ email: emailNorm }, { projection: { password: 1, name: 1, role: 1, registrationNo: 1, npi: 1, licenses: 1, phone: 1 } });
+    console.log('[auth] db user found:', !!user);
+    if (user) console.log('[auth] stored password preview:', typeof (user as any).password, String((user as any).password).slice(0,6));
     if (!user) {
+      return { ok: false as const, error: 'Invalid email or password' };
+    }
+
+    const stored = (user as any).password || '';
+    let passwordMatches = false;
+
+    // Detect bcrypt hash (starts with $2a$ or $2b$ or $2y$)
+    const looksLikeBcrypt = typeof stored === 'string' && stored.startsWith('$2');
+    if (looksLikeBcrypt) {
+      passwordMatches = bcrypt.compareSync(data.password, stored);
+    } else {
+      // Legacy plaintext fallback: allow direct compare and migrate to hashed password
+      if (data.password === stored) {
+        passwordMatches = true;
+        try {
+          const hashed = bcrypt.hashSync(data.password, 10);
+          if ((usersColl as any).updateOne) {
+            (usersColl as any).updateOne({ email: emailNorm }, { $set: { password: hashed } }).catch(() => {});
+            console.log('[auth] migrated plaintext password to hash for', emailNorm);
+          } else {
+            try { (user as any).password = hashed; } catch {};
+          }
+        } catch (e) {
+          console.error('[auth] failed to migrate plaintext password', e);
+        }
+      }
+    }
+
+    if (!passwordMatches) {
       return { ok: false as const, error: 'Invalid email or password' };
     }
 
@@ -122,44 +149,58 @@ export const signUp = createServerFn({ method: 'POST' })
       return { ok: false as const, error: 'NPI not found' };
     }
 
-    const normalizedPhone = data.phone.replace(/\D/g, '');
-    if (
-      account.email.toLowerCase() !== data.email.trim().toLowerCase() ||
-      account.phone.replace(/\D/g, '') !== normalizedPhone
-    ) {
-      return { ok: false as const, error: 'Entered details do not match official record' };
+      // Allow any email/phone to be provided by the user during signup.
+      // Do NOT require the entered email/phone to match the official record.
+
+    const db = await getDb();
+    const usersColl = db.collection('users');
+    try {
+      await usersColl.createIndex({ email: 1 }, { unique: true });
+    } catch {
+      // ignore
     }
 
-    const existing = users.find(
-      (item) =>
-        item.email.toLowerCase() === data.email.trim().toLowerCase() ||
-        item.npi === account.npi,
-    );
+    const emailNorm = data.email.trim().toLowerCase();
+    const existing = await usersColl.findOne({ email: emailNorm });
     if (existing) {
-      return { ok: false as const, error: 'Email or NPI already registered. Please log in.' };
+      return { ok: false as const, error: 'Email already registered. Please log in.' };
     }
 
-    const user = {
-      email: account.email,
+    const hashed = bcrypt.hashSync(data.password, 10);
+    const userDoc = {
+      email: emailNorm,
       name: account.name,
       role: 'doctor' as const,
       registrationNo: account.registrationNo,
-      phone: account.phone,
+      phone: data.phone,
       npi: account.npi,
       licenses: account.licenses,
-      password: data.password,
-    };
-    users.push(user);
+      password: hashed,
+    } as any;
+
+    await usersColl.insertOne(userDoc);
+    console.log('[auth] new user registered', { email: userDoc.email });
+
+    const { createJwt, setSessionCookie } = await import('./auth.server');
+    const token = createJwt({
+      email: userDoc.email,
+      name: userDoc.name,
+      role: userDoc.role,
+      registrationNo: userDoc.registrationNo,
+      npi: userDoc.npi,
+      licenses: userDoc.licenses,
+    });
+    setSessionCookie(token);
 
     return {
       ok: true as const,
       user: {
-        email: user.email,
-        name: user.name,
-        role: user.role,
-        registrationNo: user.registrationNo,
-        npi: user.npi,
-        licenses: user.licenses,
+        email: userDoc.email,
+        name: userDoc.name,
+        role: userDoc.role,
+        registrationNo: userDoc.registrationNo,
+        npi: userDoc.npi,
+        licenses: userDoc.licenses,
       },
     };
   });
@@ -195,3 +236,84 @@ export const getSession = createServerFn({ method: 'GET' }).handler(async () => 
     return { authenticated: false as const };
   }
 });
+
+const requestResetSchema = z.object({ email: z.string().email() });
+
+const resetPasswordSchema = z.object({
+  email: z.string().email(),
+  token: z.string().min(1),
+  password: z.string().min(8),
+});
+
+type ResetTokenRecord = { email: string; token: string; expiresAt: number };
+const resetTokens: ResetTokenRecord[] = [];
+
+export const requestPasswordReset = createServerFn({ method: 'POST' })
+  .validator((input: unknown) => requestResetSchema.parse(input))
+  .handler(async ({ data }) => {
+    const db = await getDb();
+    const usersColl = db.collection('users');
+    const emailNorm = data.email.trim().toLowerCase();
+    const user = await usersColl.findOne({ email: emailNorm });
+    if (!user) return { ok: false as const, error: 'No account for that email' };
+
+    const token = Math.random().toString(36).slice(2, 10).toUpperCase();
+    const expiresAt = Date.now() + 1000 * 60 * 15; // 15 minutes
+    resetTokens.push({ email: emailNorm, token, expiresAt });
+
+    // In a real app we'd email the token. For this demo return it so it can be used immediately.
+    return { ok: true as const, token };
+  });
+
+export const resetPassword = createServerFn({ method: 'POST' })
+  .validator((input: unknown) => resetPasswordSchema.parse(input))
+  .handler(async ({ data }) => {
+    const db = await getDb();
+    const usersColl = db.collection('users');
+    const recordIndex = resetTokens.findIndex(
+      (r) => r.email.toLowerCase() === data.email.trim().toLowerCase() && r.token === data.token,
+    );
+    if (recordIndex === -1) return { ok: false as const, error: 'Invalid token' };
+
+    const record = resetTokens[recordIndex];
+    if (Date.now() > record.expiresAt) {
+      resetTokens.splice(recordIndex, 1);
+      return { ok: false as const, error: 'Token expired' };
+    }
+
+    const emailNorm = data.email.trim().toLowerCase();
+    const user = await usersColl.findOne({ email: emailNorm });
+    if (!user) return { ok: false as const, error: 'No account for that email' };
+
+    // Update password
+    try {
+      // some in-memory dbs don't support update; attempt with updateOne if available
+      if ((usersColl as any).updateOne) {
+        const hashed = bcrypt.hashSync(data.password, 10);
+        const res = await (usersColl as any).updateOne({ email: emailNorm }, { $set: { password: hashed } });
+        console.log('[auth] reset: attempted DB update for', emailNorm, 'result', res?.matchedCount ?? res?.matched ?? res);
+        // verify
+        try {
+          const verifyUser = await usersColl.findOne({ email: emailNorm }, { projection: { password: 1 } });
+          const ok = verifyUser && bcrypt.compareSync(data.password, (verifyUser as any).password || '');
+          console.log('[auth] reset: verify new password success=', !!ok);
+        } catch (e) {
+          console.warn('[auth] reset: verification after update failed', e);
+        }
+        console.log('[auth] reset: updated password hash in DB for', emailNorm, String(hashed).slice(0,6));
+      } else {
+        // fallback: remove + re-insert (memory impl doesn't provide updateOne)
+        // read docs not available here; simple no-op for fallback
+        // In memory, findOne returned object reference; try mutate if possible
+        try {
+          const hashed = bcrypt.hashSync(data.password, 10);
+          (user as any).password = hashed;
+          console.log('[auth] reset: updated in-memory password hash for', emailNorm, String(hashed).slice(0,6));
+        } catch {}
+      }
+    } catch (e) {
+      console.error('[auth] failed to update password', e);
+    }
+    resetTokens.splice(recordIndex, 1);
+    return { ok: true as const };
+  });

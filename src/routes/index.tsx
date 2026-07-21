@@ -6,7 +6,7 @@ import {
   verifyClient,
   submitVerification,
 } from "@/lib/verification.functions";
-import { getSession, login, logout, signUp } from "@/lib/auth.functions";
+import { getSession, login, logout, signUp, requestPasswordReset, resetPassword } from "@/lib/auth.functions";
 
 export const Route = createFileRoute("/")({
   component: HomePage,
@@ -66,6 +66,15 @@ function HomePage() {
   const loginFn = useServerFn(login);
   const signUpFn = useServerFn(signUp);
   const logoutFn = useServerFn(logout);
+  const requestResetFn = useServerFn(requestPasswordReset);
+  const resetPasswordFn = useServerFn(resetPassword);
+
+  const [showForgot, setShowForgot] = useState(false);
+  const [resetEmail, setResetEmail] = useState("");
+  const [resetToken, setResetToken] = useState("");
+  const [resetNewPassword, setResetNewPassword] = useState("");
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
+  const [resetSubmitting, setResetSubmitting] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -109,13 +118,19 @@ function HomePage() {
       if (!res.ok) {
         setAuthError(res.error ?? (authMode === 'signup' ? 'Signup failed' : 'Login failed'));
       } else if (authMode === 'signup') {
-        setPendingSignUp({ npi: trimmedNpi, email: trimmedEmail, phone: trimmedPhone });
-        setPendingSignIn(res.user);
+        // Automatically sign the user in after successful signup (no extra confirmation)
+        setUser(res.user as AuthUser);
+        setPendingSignUp(null);
+        setPendingSignIn(null);
         setAuthMode('login');
         setNpi('');
         setPhone('');
         setPassword('');
         setAuthError(null);
+        if ((res.user as AuthUser).npi && (res.user as AuthUser).licenses?.length) {
+          setDoctor({ npi: (res.user as AuthUser).npi!, doctorName: (res.user as AuthUser).name, licenses: (res.user as AuthUser).licenses! });
+          setStep(2);
+        }
       } else {
         setPendingSignIn(res.user);
         setPendingSignUp(null);
@@ -300,7 +315,81 @@ function HomePage() {
                       onChange={(e) => setPassword(e.target.value)}
                       required
                     />
+                    <div className="mt-2 text-sm">
+                      <button type="button" className="font-medium text-primary underline" onClick={() => { setShowForgot((s) => !s); setResetMsg(null); }}>
+                        Forgot password?
+                      </button>
+                    </div>
                   </div>
+                  {showForgot && (
+                    <div className="mt-4 space-y-3">
+                      <div>
+                        <label className="block text-sm font-medium mb-1.5">Email to reset</label>
+                        <input className="field-input" value={resetEmail} onChange={(e) => setResetEmail(e.target.value)} />
+                      </div>
+                      <div className="flex gap-3 items-center">
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          onClick={async () => {
+                            setResetMsg(null);
+                            setResetSubmitting(true);
+                            try {
+                              const res = await requestResetFn({ data: { email: resetEmail } });
+                              if (!res.ok) setResetMsg(res.error ?? 'Request failed');
+                              else setResetMsg(`Reset token: ${res.token}`);
+                            } catch (err) {
+                              setResetMsg(err instanceof Error ? err.message : 'Request failed');
+                            } finally {
+                              setResetSubmitting(false);
+                            }
+                          }}
+                          disabled={resetSubmitting}
+                        >
+                          Send reset token
+                        </button>
+                        <span className="text-sm text-[var(--color-muted-foreground)]">(token shown for demo)</span>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1.5">Token</label>
+                        <input className="field-input" value={resetToken} onChange={(e) => setResetToken(e.target.value)} />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1.5">New password</label>
+                        <input className="field-input" type="password" value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} />
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          onClick={async () => {
+                            setResetMsg(null);
+                            setResetSubmitting(true);
+                            try {
+                              const res = await resetPasswordFn({ data: { email: resetEmail, token: resetToken, password: resetNewPassword } });
+                              if (!res.ok) setResetMsg(res.error ?? 'Reset failed');
+                              else {
+                                setResetMsg('Password updated — you can sign in now');
+                                // Hide the reset UI and show the sign-in form
+                                setShowForgot(false);
+                                setAuthMode('login');
+                                setAuthError(null);
+                                setResetNewPassword('');
+                              }
+                            } catch (err) {
+                              setResetMsg(err instanceof Error ? err.message : 'Reset failed');
+                            } finally {
+                              setResetSubmitting(false);
+                            }
+                          }}
+                          disabled={resetSubmitting}
+                        >
+                          Reset password
+                        </button>
+                      </div>
+                      {resetMsg && <p className="text-sm mt-2">{resetMsg}</p>}
+                    </div>
+                  )}
                   {authError ? <p className="text-sm text-destructive">{authError}</p> : null}
                   <button type="submit" className="btn-primary" disabled={authSubmitting}>
                     {authSubmitting ? (authMode === 'signup' ? 'Signing up…' : 'Signing in…') : authMode === 'signup' ? 'Sign up' : 'Sign in'}
